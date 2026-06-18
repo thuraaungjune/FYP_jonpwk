@@ -7,7 +7,7 @@ set -e
 # =====================================================================
 EVAL_SCRIPT="evaluate.py"
 PROMPT_FILE="vanilla_prompt.txt"
-DATASET_PATH="/home/thura/data/Jawi-OCR-data-v4-aug_ready/test_part_1"
+DATASET_PATH="/dest/thura/data/Jawi-OCR-data-v4-augmented/test"
 KRAKEN_LOCAL_PATH="/home/thura/models/Jawi-OCR-Kraken-v1.mlmodel"
 KRAKEN_HF_REPO="culturalheritagenus/Jawi-OCR-Kraken-v1"
 
