@@ -94,11 +94,14 @@ def main():
         test_dataset = test_dataset.select(indices)
         print(f"Subsampling successful. Array size locked to: {len(test_dataset)}")
 
-    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device configuration set to: {device}")
     
     model_lower = args.model.lower()
-    is_gemma_family = "gemma" in model_lower or "sea-lion" in model_lower
+    # Only true for actual Gemma checkpoints
+    is_gemma_family = "gemma" in model_lower
+    # Treat Sea-Lion (Qwen SEA-LION) as part of the Qwen family
+    is_qwen_family = ("qwen" in model_lower) or ("sea-lion" in model_lower)
     is_deepseek_ocr = args.deepseek or "deepseek" in model_lower
 
     processor = None
@@ -116,7 +119,7 @@ def main():
         except Exception as kraken_init_err:
             print(f"CRITICAL: Failed to load Kraken infrastructure: {kraken_init_err}")
             kraken_model = None
-        
+
     elif is_deepseek_ocr:
         print("DeepSeek OCR Engine Mode activated...")
         deepseek_tokenizer, model = build_deepseek_model(args.model)
@@ -128,20 +131,42 @@ def main():
         deepseek_output_dir = os.path.join(CACHE_DIR, "deepseek_eval_outputs")
         os.makedirs(deepseek_output_dir, exist_ok=True)
         deepseek_prompt = f"<image>\n{user_prompt_text}"
-        
+
     elif is_gemma_family:
         print("Gemma-3 Engine Mode activated...")
         processor, model = build_gemma_model(args.model, device)
 
-    else:
-        print(f"Initializing Transformers Engine on Target Device: {device}")
+    elif is_qwen_family:
+        print(f"Initializing Qwen-family Engine on Target Device: {device}")
         if args.jawi_qwen_v1 or args.jawi_qwen_v2:
             print(f"Configuring explicit Jawi-Qwen structural loaders...")
             processor, model = build_qwen_model(args.model, model_lower, device, jawi_qwen_v1=args.jawi_qwen_v1, jawi_qwen_v2=args.jawi_qwen_v2)
         else:
             processor, model = build_qwen_model(args.model, model_lower, device)
-            
-        model.eval()
+
+        try:
+            model.eval()
+        except Exception:
+            pass
+
+    else:
+        print(f"Initializing Transformers Engine on Target Device: {device}")
+        # Fallback: attempt to load via Qwen runner as general handler
+        if args.jawi_qwen_v1 or args.jawi_qwen_v2:
+            print(f"Configuring explicit Jawi-Qwen structural loaders...")
+            processor, model = build_qwen_model(args.model, model_lower, device, jawi_qwen_v1=args.jawi_qwen_v1, jawi_qwen_v2=args.jawi_qwen_v2)
+        else:
+            processor, model = build_qwen_model(args.model, model_lower, device)
+        try:
+            model.eval()
+        except Exception:
+            pass
+
+    if model is not None:
+        try:
+            model.eval()
+        except Exception:
+            pass
 
     chrf_metric = CHRF()
     results_records = []
@@ -169,6 +194,9 @@ def main():
 
         batch_predictions = []
         
+        # Safe device target identification (safeguards pipeline tracking)
+        target_device = model.device if hasattr(model, "device") else device
+
         # --- ENGINE ROUTING LOGIC ---
         if args.kraken:
             for img in batch_imgs:
@@ -213,10 +241,8 @@ def main():
                     batch_predictions.append(pred)
                 
         else:
-            # Qwen / Standard VLM Architecture Batch-Optimized execution
             try:
-                # If using Qwen models, utilize structural vision utilities directly to safely batch lists
-                if "qwen" in model_lower:
+                if "qwen" in model_lower or "qari" in model_lower:
                     from qwen_vl_utils import process_vision_info
                     
                     batch_inputs_structs = []
@@ -226,11 +252,11 @@ def main():
                         image_inputs, video_inputs = process_vision_info(messages)
                         batch_inputs_structs.append((text_prompt, image_inputs, video_inputs))
                         
-                    # Aggregate structural keys into full batch tensors
                     text_prompts = [x[0] for x in batch_inputs_structs]
                     all_images = [x[1][0] for x in batch_inputs_structs if x[1]]
                     
-                    inputs = processor(text=text_prompts, images=all_images, padding="longest", return_tensors="pt").to(model.device)
+                    inputs = processor(text=text_prompts, images=all_images, padding="longest", return_tensors="pt").to(target_device)
+                    
                     if hasattr(model, "dtype"):
                         inputs = {k: v.to(model.dtype) if torch.is_floating_point(v) else v for k, v in inputs.items()}
                         
@@ -246,30 +272,26 @@ def main():
                     generated_ids_trimmed = [out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs["input_ids"], generated_ids)]
                     
                     if args.jawi_qwen_v1 or args.jawi_qwen_v2:
-                        batch_predictions = processor.tokenizer.batch_decode(generated_ids_trimmed, skip_special_tokens=True)
+                        batch_preds = processor.tokenizer.batch_decode(generated_ids_trimmed, skip_special_tokens=True)
                     else:
-                        batch_predictions = processor.batch_decode(generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+                        batch_preds = processor.batch_decode(generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)
                         
-                    batch_predictions = [p.strip() for p in batch_predictions]
+                    batch_predictions.extend([p.strip() for p in batch_preds])
                 else:
-                    # Non-Qwen standard transformers fallback execution loop
                     for img in batch_imgs:
                         inputs = prepare_standard_inputs(processor, model, img, user_prompt_text, model_lower)
-                        pred = generate_standard_text(processor, model, inputs, jawi_qwen_v1=args.jawi_qwen_v1, jawi_qwen_v2=args.jawi_qwen_v2)
-                        batch_predictions.append(pred)
+                        pred_list = generate_standard_text(processor, model, inputs, jawi_qwen_v1=args.jawi_qwen_v1, jawi_qwen_v2=args.jawi_qwen_v2)
+                        batch_predictions.append(pred_list[0] if isinstance(pred_list, list) else pred_list)
             except Exception as batch_vlm_err:
                 print(f"\n[Batch VLM Failure Catch] Index window context starting at {i}: {batch_vlm_err}")
-                # Fallback to single element loops for the batch if a multi-tensor stack fails
-                batch_predictions = []
                 for img in batch_imgs:
                     try:
                         inputs = prepare_standard_inputs(processor, model, img, user_prompt_text, model_lower)
-                        pred = generate_standard_text(processor, model, inputs, jawi_qwen_v1=args.jawi_qwen_v1, jawi_qwen_v2=args.jawi_qwen_v2)
+                        pred_list = generate_standard_text(processor, model, inputs, jawi_qwen_v1=args.jawi_qwen_v1, jawi_qwen_v2=args.jawi_qwen_v2)
+                        batch_predictions.append(pred_list[0] if isinstance(pred_list, list) else pred_list)
                     except Exception:
-                        pred = ""
-                    batch_predictions.append(pred)
+                        batch_predictions.append("")
 
-        # Pad remaining elements to maintain execution sizing
         if len(batch_predictions) < len(batch_slice):
             batch_predictions += [""] * (len(batch_slice) - len(batch_predictions))
 
@@ -330,13 +352,11 @@ def main():
 
     if not results_records: return
     df_results = pd.DataFrame(results_records)
-    # Ensure output parent directories exist (handles nested paths)
+    
     csv_parent = os.path.dirname(csv_output_path)
-    if csv_parent:
-        os.makedirs(csv_parent, exist_ok=True)
+    if csv_parent: os.makedirs(csv_parent, exist_ok=True)
     json_parent = os.path.dirname(json_output_path)
-    if json_parent:
-        os.makedirs(json_parent, exist_ok=True)
+    if json_parent: os.makedirs(json_parent, exist_ok=True)
 
     df_results.to_csv(csv_output_path, index=False, encoding="utf-8")
     
